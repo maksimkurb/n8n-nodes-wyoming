@@ -179,18 +179,24 @@ async function _handleWyomingCommunication<T>(
 					logger.debug(`${logPrefix} Cleaning up connection (${reason || 'normal close'}). State: ${client.readyState}`);
 					await yieldEventLoop();
 					client.removeAllListeners();
-					client.end();
-					client.destroySoon();
+					client.destroy();
 				}
 			}
 		};
 
-		appTimeoutHandle = setTimeout(async () => {
+		appTimeoutHandle = setTimeout(() => {
 			const errorMsg = `Application timeout reached after ${timeoutMs}ms waiting for ${operationType} result`;
 			logger.warn(`${logPrefix} ${errorMsg}`);
-			await cleanup('application timeout');
 			const timeoutError = new NodeOperationError(execContext.getNode(), errorMsg, { itemIndex });
 			(timeoutError as any).isTimeout = true;
+			processingState.error = timeoutError;
+			processingState.done = true;
+			appTimeoutHandle = null;
+			if (!connectionClosed) {
+				connectionClosed = true;
+				client.removeAllListeners();
+				client.destroy();
+			}
 			reject(timeoutError);
 		}, timeoutMs);
 
@@ -538,6 +544,7 @@ async function convertAudioToPcm(
 	targetChannels: number,
 	logger: IExecuteFunctions['logger'],
 	logPrefix: string,
+	timeoutMs: number,
 ): Promise<Buffer> {
 
 	const ffmpegArgs = [
@@ -555,6 +562,31 @@ async function convertAudioToPcm(
 		const ffmpegProcess = spawn('ffmpeg', ffmpegArgs, { stdio: ['pipe', 'pipe', 'pipe'] });
 		const outputChunks: Buffer[] = [];
 		const errorChunks: Buffer[] = [];
+		let settled = false;
+
+		const timeoutHandle = setTimeout(() => {
+			if (settled) return;
+			settled = true;
+			logger.warn(`${logPrefix} ffmpeg conversion timed out after ${timeoutMs}ms. Killing process.`);
+			ffmpegProcess.kill('SIGKILL');
+			const timeoutError = new Error(`ffmpeg conversion timed out after ${timeoutMs}ms`);
+			(timeoutError as any).isTimeout = true;
+			reject(timeoutError);
+		}, timeoutMs);
+
+		const resolveOnce = (value: Buffer) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timeoutHandle);
+			resolve(value);
+		};
+
+		const rejectOnce = (error: Error) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timeoutHandle);
+			reject(error);
+		};
 
 		ffmpegProcess.stdout.on('data', (chunk: Buffer) => {
 			outputChunks.push(chunk);
@@ -583,7 +615,7 @@ async function convertAudioToPcm(
 
 				const ffmpegError = new Error(userMessage);
 				(ffmpegError as any).isFFmpegError = true;
-				reject(ffmpegError);
+				rejectOnce(ffmpegError);
 			} else {
 				const pcmBuffer = Buffer.concat(outputChunks);
 				if (pcmBuffer.length === 0) {
@@ -591,11 +623,11 @@ async function convertAudioToPcm(
 					if (stderrOutput) logger.warn(`${logPrefix} ffmpeg stderr (may contain clues): ${stderrOutput}`);
 					const ffmpegError = new Error('ffmpeg conversion produced empty output.');
 					(ffmpegError as any).isFFmpegError = true;
-					reject(ffmpegError);
+					rejectOnce(ffmpegError);
 				} else {
 					logger.info(`${logPrefix} ffmpeg conversion successful. Resulting PCM buffer size: ${pcmBuffer.length} bytes.`);
 					if (stderrOutput) logger.warn(`${logPrefix} ffmpeg stderr (possibly warnings): ${stderrOutput}`);
-					resolve(pcmBuffer);
+					resolveOnce(pcmBuffer);
 				}
 			}
 		});
@@ -604,7 +636,7 @@ async function convertAudioToPcm(
 			logger.error(`${logPrefix} Failed to start ffmpeg process: ${err.message}`);
 			const spawnError = new Error(`Failed to spawn ffmpeg: ${err.message}. Is ffmpeg installed and in PATH?`);
 			(spawnError as any).isSpawnError = true;
-			reject(spawnError);
+			rejectOnce(spawnError);
 		});
 
 		ffmpegProcess.stdin.on('error', (err: NodeJS.ErrnoException) => {
@@ -630,7 +662,7 @@ async function convertAudioToPcm(
 			logger.error(`${logPrefix} Exception while initiating write to ffmpeg stdin: ${error.message}`);
 			const stdinError = new Error(`Failed writing input to ffmpeg: ${error.message}`);
 			(stdinError as any).isStdinError = true;
-			reject(stdinError);
+			rejectOnce(stdinError);
 			if (!ffmpegProcess.killed) {
 				ffmpegProcess.kill();
 			}
@@ -789,6 +821,8 @@ export class WyomingNode implements INodeType {
 			const credentials = await this.getCredentials('wyomingApi') as WyomingCredentials;
 			const serverAddress = `${credentials.host}:${credentials.port}`;
 			const timeoutMs = this.getNodeParameter('timeoutMs', itemIndex, 60000) as number;
+			const operationDeadline = performance.now() + timeoutMs;
+			const remainingTimeoutMs = () => Math.max(1, Math.ceil(operationDeadline - performance.now()));
 			try {
 				let newItem: INodeExecutionData | null = null;
 
@@ -815,7 +849,7 @@ export class WyomingNode implements INodeType {
 					try {
 						const conversionStartTime = performance.now();
 						// Pass logger directly, it doesn't need the full context
-						pcmBufferToSend = await convertAudioToPcm(inputAudioBuffer, fileName, SAMPLE_RATE, SAMPLE_CHANNELS, logger, logPrefix);
+						pcmBufferToSend = await convertAudioToPcm(inputAudioBuffer, fileName, SAMPLE_RATE, SAMPLE_CHANNELS, logger, logPrefix, remainingTimeoutMs());
 						const conversionEndTime = performance.now();
 						conversionDurationMs = conversionEndTime - conversionStartTime;
 						logger.info(`${logPrefix} STT: FFmpeg conversion took ${conversionDurationMs.toFixed(2)} ms.`);
@@ -834,7 +868,7 @@ export class WyomingNode implements INodeType {
 					logger.debug(`${logPrefix} STT: Starting transcription process. Language: ${language}`);
 					const transcriptionStartTime = performance.now();
 					// Pass `this` (IExecuteFunctions) as execContext
-					const transcription = await _transcribeAudio(this, itemIndex, serverAddress, pcmBufferToSend, language, timeoutMs);
+					const transcription = await _transcribeAudio(this, itemIndex, serverAddress, pcmBufferToSend, language, remainingTimeoutMs());
 					const transcriptionEndTime = performance.now();
 					transcriptionDurationMs = transcriptionEndTime - transcriptionStartTime;
 					logger.info(`${logPrefix} STT: Wyoming transcription took ${transcriptionDurationMs.toFixed(2)} ms.`);
@@ -862,7 +896,7 @@ export class WyomingNode implements INodeType {
 					logger.debug(`${logPrefix} TTS: Starting synthesis process for text: "${textToSpeak.substring(0, 50)}${textToSpeak.length > 50 ? '...' : ''}"`);
 					const synthesisStartTime = performance.now();
 					// Pass `this` (IExecuteFunctions) as execContext
-					const rawPcmAudioBuffer = await _synthesizeAudio(this, itemIndex, serverAddress, textToSpeak, voice || undefined, timeoutMs); // Pass undefined if empty string
+					const rawPcmAudioBuffer = await _synthesizeAudio(this, itemIndex, serverAddress, textToSpeak, voice || undefined, remainingTimeoutMs()); // Pass undefined if empty string
 					const synthesisEndTime = performance.now();
 					synthesisDurationMs = synthesisEndTime - synthesisStartTime;
 					logger.info(`${logPrefix} TTS: Wyoming synthesis took ${synthesisDurationMs.toFixed(2)} ms. Received ${rawPcmAudioBuffer.length} bytes of PCM data.`);
