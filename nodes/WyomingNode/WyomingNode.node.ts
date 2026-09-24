@@ -36,12 +36,43 @@ const DEFAULT_TTS_OUTPUT_MIME_TYPE = 'audio/wav';
 const yieldEventLoop = () => new Promise(resolve => setImmediate(resolve));
 
 const _waitForDrain = (client: net.Socket, logPrefix: string): Promise<void> => {
-	return new Promise((resolve) => {
-		// logger.trace(`${logPrefix} Write buffer full. Waiting for drain event...`);
-		client.once('drain', () => {
-			// logger.trace(`${logPrefix} Drain event received. Resuming writes.`);
+	return new Promise((resolve, reject) => {
+		let settled = false;
+
+		const cleanupListeners = () => {
+			client.off('drain', onDrain);
+			client.off('close', onClose);
+			client.off('error', onError);
+		};
+
+		const onDrain = () => {
+			if (settled) return;
+			settled = true;
+			cleanupListeners();
 			resolve();
-		});
+		};
+
+		const onClose = () => {
+			if (settled) return;
+			settled = true;
+			cleanupListeners();
+			reject(new Error(`${logPrefix} Socket closed while waiting for write buffer to drain`));
+		};
+
+		const onError = (error: Error) => {
+			if (settled) return;
+			settled = true;
+			cleanupListeners();
+			reject(error);
+		};
+
+		client.once('drain', onDrain);
+		client.once('close', onClose);
+		client.once('error', onError);
+
+		if (client.destroyed) {
+			onClose();
+		}
 	});
 };
 
@@ -165,33 +196,50 @@ async function _handleWyomingCommunication<T>(
 		const client = new net.Socket();
 		let receivedDataBuffer = Buffer.alloc(0);
 		let connectionClosed = false;
+		let settled = false;
 		let appTimeoutHandle: NodeJS.Timeout | null = null;
 		const processingState: { audioChunks: Buffer[], done: boolean, result?: T, error?: Error } = {
 			audioChunks: [],
 			done: false,
 		};
 
-		const cleanup = async (reason?: string) => {
-			if (appTimeoutHandle) { clearTimeout(appTimeoutHandle); appTimeoutHandle = null; }
+		const cleanup = (reason?: string) => {
+			if (appTimeoutHandle) {
+				clearTimeout(appTimeoutHandle);
+				appTimeoutHandle = null;
+			}
 			if (!connectionClosed) {
 				connectionClosed = true;
 				if (!client.destroyed) {
 					logger.debug(`${logPrefix} Cleaning up connection (${reason || 'normal close'}). State: ${client.readyState}`);
-					await yieldEventLoop();
-					client.removeAllListeners();
-					client.end();
-					client.destroySoon();
+					client.destroy();
 				}
 			}
 		};
 
-		appTimeoutHandle = setTimeout(async () => {
+		const rejectOnce = (error: Error, reason: string) => {
+			if (settled) return;
+			settled = true;
+			cleanup(reason);
+			reject(error);
+		};
+
+		const resolveOnce = (result: T, reason: string) => {
+			if (settled) return;
+			settled = true;
+			cleanup(reason);
+			resolve(result);
+		};
+
+		appTimeoutHandle = setTimeout(() => {
+			if (settled) return;
 			const errorMsg = `Application timeout reached after ${timeoutMs}ms waiting for ${operationType} result`;
 			logger.warn(`${logPrefix} ${errorMsg}`);
-			await cleanup('application timeout');
 			const timeoutError = new NodeOperationError(execContext.getNode(), errorMsg, { itemIndex });
 			(timeoutError as any).isTimeout = true;
-			reject(timeoutError);
+			processingState.error = timeoutError;
+			processingState.done = true;
+			rejectOnce(timeoutError, 'application timeout');
 		}, timeoutMs);
 
 		client.on('connect', async () => {
@@ -205,11 +253,11 @@ async function _handleWyomingCommunication<T>(
 			} catch (err: any) {
 				const errorMsg = `Error during initial data sending sequence: ${err.message}`;
 				logger.error(`${logPrefix} ${errorMsg}`, err);
-				await cleanup('write error sequence');
-				if (appTimeoutHandle && !connectionClosed) {
-					// Use the error directly if it's already a NodeOperationError
-					reject(err instanceof NodeOperationError ? err : new NodeOperationError(execContext.getNode(), errorMsg, { itemIndex }));
-				}
+				// Use the error directly if it's already a NodeOperationError
+				rejectOnce(
+					err instanceof NodeOperationError ? err : new NodeOperationError(execContext.getNode(), errorMsg, { itemIndex }),
+					'write error sequence',
+				);
 			}
 		});
 
@@ -288,17 +336,19 @@ async function _handleWyomingCommunication<T>(
 
 				if (processingState.done) {
 					logger.info(`${logPrefix} Operation marked as done. Cleaning up.`);
-					await cleanup(processingState.error ? 'error processing event' : 'operation complete');
 					if (processingState.error) {
-						reject(processingState.error);
+						rejectOnce(processingState.error, 'error processing event');
 					} else {
 						try {
 							const finalResult = await getFinalResult(processingState);
-							resolve(finalResult);
+							resolveOnce(finalResult, 'operation complete');
 						} catch (resultError: any)
 						 {
 							logger.error(`${logPrefix} Error finalizing result: ${resultError.message}`, resultError);
-							reject(resultError instanceof NodeOperationError ? resultError : new NodeOperationError(execContext.getNode(), resultError.message || String(resultError), { itemIndex }));
+							rejectOnce(
+								resultError instanceof NodeOperationError ? resultError : new NodeOperationError(execContext.getNode(), resultError.message || String(resultError), { itemIndex }),
+								'result finalization error',
+							);
 						}
 					}
 					return;
@@ -310,45 +360,40 @@ async function _handleWyomingCommunication<T>(
 			}
 		});
 
-		client.on('end', async () => {
-			await cleanup('server ended connection');
-			if (!processingState.done && appTimeoutHandle && !connectionClosed) {
-				const errorMsg = `Connection closed by server before ${operationType} completed.`;
-				logger.warn(`${logPrefix} ${errorMsg}`);
-				const closeError = new NodeOperationError(execContext.getNode(), errorMsg, { itemIndex });
-				(closeError as any).isConnectionClosed = true;
-				reject(closeError);
-			}
+		client.on('end', () => {
+			if (settled || processingState.done) return;
+
+			const errorMsg = `Connection closed by server before ${operationType} completed.`;
+			logger.warn(`${logPrefix} ${errorMsg}`);
+			const closeError = new NodeOperationError(execContext.getNode(), errorMsg, { itemIndex });
+			(closeError as any).isConnectionClosed = true;
+			rejectOnce(closeError, 'server ended connection');
 		});
 
-		client.on('close', async (hadError: boolean) => {
-			const cleanupReason = `closed${hadError ? ' with error' : ''}`;
-			const shouldReject = !processingState.done && appTimeoutHandle && !connectionClosed;
-			await cleanup(cleanupReason);
-			if (shouldReject) {
-				 const errorMsg = `Connection closed unexpectedly${hadError ? ' with error' : ''}.`;
-				 logger.warn(`${logPrefix} ${errorMsg}`);
-				 const closeError = new NodeOperationError(execContext.getNode(), errorMsg, { itemIndex });
-				 (closeError as any).isConnectionClosed = true;
-				 reject(closeError);
-			 }
+		client.on('close', (hadError: boolean) => {
+			if (settled || processingState.done) return;
+
+			const errorMsg = `Connection closed unexpectedly${hadError ? ' with error' : ''}.`;
+			logger.warn(`${logPrefix} ${errorMsg}`);
+			const closeError = new NodeOperationError(execContext.getNode(), errorMsg, { itemIndex });
+			(closeError as any).isConnectionClosed = true;
+			rejectOnce(closeError, `closed${hadError ? ' with error' : ''}`);
 		});
 
-		client.on('error', async (err: Error & { code?: string }) => {
+		client.on('error', (err: Error & { code?: string }) => {
+			if (settled) return;
+
 			const code = err.code;
 			let errorMsg = `Socket error: ${err.message}`;
 			if (code) errorMsg += ` (Code: ${code})`;
 			logger.error(`${logPrefix} ${errorMsg}`, err);
-			const shouldReject = !processingState.done && appTimeoutHandle && !connectionClosed;
-			await cleanup('socket error');
-			if (shouldReject) {
-				const nodeError = new NodeOperationError(execContext.getNode(), errorMsg, { itemIndex });
-				(nodeError as any).originalCode = code;
-				if (code === 'ECONNREFUSED' || code === 'ENOTFOUND' || code === 'EHOSTUNREACH') {
-					(nodeError as any).isConfigurationError = true;
-				}
-				reject(nodeError);
+
+			const nodeError = new NodeOperationError(execContext.getNode(), errorMsg, { itemIndex });
+			(nodeError as any).originalCode = code;
+			if (code === 'ECONNREFUSED' || code === 'ENOTFOUND' || code === 'EHOSTUNREACH') {
+				(nodeError as any).isConfigurationError = true;
 			}
+			rejectOnce(nodeError, 'socket error');
 		});
 
 		client.on('drain', async () => {
